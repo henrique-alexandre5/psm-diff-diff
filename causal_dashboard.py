@@ -68,24 +68,24 @@ class CausalDashboard:
         plt.rcParams['figure.autolayout'] = False
     
     # =========================================================================
-    # MAIN DID RESULT
+    # MAIN ATT RESULT (Staggered)
     # =========================================================================
     
     def plot_main_result(self, ax=None) -> None:
         """Plot main ATT result with confidence interval."""
-        result = self.analyzer.estimate_did()
+        result = self.analyzer.estimate()
         
         if ax is None:
             fig, ax = plt.subplots(figsize=(8, 5))
         
         # Bar for ATT
-        color = 'tab:green' if result.att > 0 else 'tab:red'
-        ax.barh(['ATT'], [result.att], color=color, alpha=0.65, height=0.35)
+        color = 'tab:green' if result.overall_att > 0 else 'tab:red'
+        ax.barh(['ATT'], [result.overall_att], color=color, alpha=0.65, height=0.35)
         
         # Error bar for CI
         ax.errorbar(
-            result.att, 0, 
-            xerr=[[result.att - result.ci_lower], [result.ci_upper - result.att]],
+            result.overall_att, 0, 
+            xerr=[[result.overall_att - result.overall_ci_lower], [result.overall_ci_upper - result.overall_att]],
             fmt='o', color='black', capsize=8, capthick=2, markersize=10
         )
         
@@ -93,14 +93,14 @@ class CausalDashboard:
         ax.axvline(x=0, color='red', linestyle='--', alpha=0.5, linewidth=2)
         
         # Annotations
-        sig = '***' if result.p_value < 0.01 else '**' if result.p_value < 0.05 else '*' if result.p_value < 0.1 else ''
-        ax.set_title(f'Main Effect: ATT = {result.att:,.0f} {sig}', fontsize=16, fontweight='bold')
+        sig = result.significance_stars
+        ax.set_title(f'Main Effect: ATT = {result.overall_att:,.0f} {sig}', fontsize=16, fontweight='bold')
         ax.set_xlabel(f'Causal Effect on {self.analyzer.outcome_col}')
         
         # Add text annotation
         ax.text(
             0.02, 0.93, 
-            f'95% CI: [{result.ci_lower:,.0f}, {result.ci_upper:,.0f}]\np-value: {result.p_value:.4f}',
+            f'95% CI: [{result.overall_ci_lower:,.0f}, {result.overall_ci_upper:,.0f}]\np-value: {result.overall_pvalue:.4f}',
             transform=ax.transAxes, fontsize=9.5, verticalalignment='top',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.35, pad=0.3)
         )
@@ -198,8 +198,9 @@ class CausalDashboard:
         
         x = range(len(cohort_df))
         
-        # Color by significance
-        colors = ['tab:blue' if p < 0.05 else 'gray' for p in cohort_df['p_value']]
+        # Color by significance (use 'pvalue' column)
+        pval_col = 'pvalue' if 'pvalue' in cohort_df.columns else 'p_value'
+        colors = ['tab:blue' if p < 0.05 else 'gray' for p in cohort_df[pval_col]]
         
         ax.bar(x, cohort_df['att'], color=colors, alpha=0.7, edgecolor='black')
         ax.errorbar(
@@ -225,7 +226,7 @@ class CausalDashboard:
         ax.grid(alpha=0.3, axis='y')
         
         # Add summary stats
-        std_att = cohort_df['att'].std()
+        std_att = cohort_df['att'].std() if len(cohort_df) > 1 else 0
         ax.text(
             0.97, 0.03,
             f'Mean: {overall_att:,.0f}\nStd: {std_att:,.0f}\nN cohorts: {len(cohort_df)}',
@@ -234,7 +235,159 @@ class CausalDashboard:
         )
     
     # =========================================================================
-    # EFFECT MATRIX HEATMAP
+    # TREATMENT COHORT DISTRIBUTION
+    # =========================================================================
+    
+    def plot_cohort_distribution(self, ax=None, save_path: Optional[str] = None) -> None:
+        """
+        Plot the distribution of treatment timing (staggered adoption).
+        
+        Parameters
+        ----------
+        ax : matplotlib axis, optional
+        save_path : str, optional
+            Path to save the figure
+        """
+        cohorts = self.analyzer.matched_df['matching_cohort'].value_counts().sort_index()
+        
+        created_fig = False
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(12, 5))
+            created_fig = True
+        
+        # Bar chart
+        x = range(len(cohorts))
+        ax.bar(x, cohorts.values, color='steelblue', edgecolor='white', alpha=0.8)
+        
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(c) for c in cohorts.index], rotation=45, ha='right', fontsize=9)
+        ax.set_xlabel('Treatment Cohort (YYYYMM)', fontsize=11)
+        ax.set_ylabel('Number of Matched Pairs', fontsize=11)
+        ax.set_title('Treatment Timing Distribution (Staggered Adoption)', 
+                    fontsize=13, fontweight='bold', pad=10)
+        
+        # Add summary
+        ax.text(
+            0.98, 0.95,
+            f'N cohorts: {len(cohorts)}\nTotal pairs: {cohorts.sum():,}',
+            transform=ax.transAxes, fontsize=9, ha='right', va='top',
+            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8)
+        )
+        
+        ax.grid(alpha=0.3, axis='y')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+            print(f"✓ Cohort distribution saved to: {save_path}")
+        
+        if created_fig:
+            plt.show()
+    
+    # =========================================================================
+    # ATT(g,t) HEATMAP
+    # =========================================================================
+    
+    def plot_att_heatmap(
+        self,
+        pre_periods: int = 6,
+        post_periods: int = 12,
+        figsize: Optional[Tuple[int, int]] = None,
+        cmap: str = 'RdYlGn',
+        annot: bool = True,
+        mark_treatment: bool = True,
+        save_path: Optional[str] = None,
+        ax: Optional[plt.Axes] = None,
+    ) -> None:
+        """
+        Plot ATT(g,t) heatmap: treatment effects by cohort × event time.
+        
+        This is the core staggered DiD output showing how effects vary across
+        cohorts and over time relative to treatment.
+        
+        Parameters
+        ----------
+        pre_periods : int
+            Number of pre-treatment periods to show
+        post_periods : int
+            Number of post-treatment periods to show
+        figsize : tuple, optional
+            Figure size (auto-calculated if None)
+        cmap : str
+            Colormap name (default: RdYlGn for red-yellow-green)
+        annot : bool
+            Whether to annotate cells with values
+        mark_treatment : bool
+            Whether to draw a vertical line at e=0
+        save_path : str, optional
+            Path to save the figure
+        ax : matplotlib axis, optional
+        """
+        matrix = self.analyzer.effect_matrix(pre_periods, post_periods, metric='att')
+        
+        if len(matrix) == 0:
+            print("No ATT(g,t) data available")
+            return
+        
+        # Auto-size based on matrix dimensions
+        created_fig = False
+        if ax is None:
+            if figsize is None:
+                n_cols = len(matrix.columns)
+                n_rows = len(matrix)
+                figsize = (max(10, min(20, n_cols * 1.0)), max(5, min(12, n_rows * 0.6)))
+            fig, ax = plt.subplots(figsize=figsize)
+            created_fig = True
+        
+        # Calculate symmetric vmin/vmax centered at 0
+        vmax = max(abs(matrix.max().max()), abs(matrix.min().min()))
+        vmin = -vmax
+        
+        # Create heatmap
+        sns.heatmap(
+            matrix,
+            ax=ax,
+            cmap=cmap,
+            center=0,
+            vmin=vmin,
+            vmax=vmax,
+            annot=annot,
+            fmt=',.0f',
+            annot_kws={'fontsize': 7 if len(matrix.columns) > 12 else 8},
+            linewidths=0.5,
+            linecolor='white',
+            cbar_kws={'label': f'Effect on {self.analyzer.outcome_col}', 'shrink': 0.8}
+        )
+        
+        # Mark treatment time (e=0)
+        if mark_treatment and 'e=0' in matrix.columns:
+            e0_idx = list(matrix.columns).index('e=0')
+            ax.axvline(x=e0_idx, color='black', linewidth=2.5, linestyle='--', alpha=0.8)
+        
+        ax.set_xlabel('Event Time (e=0 is treatment month)', fontsize=11)
+        ax.set_ylabel('Treatment Cohort', fontsize=11)
+        ax.set_title('ATT(g,t): Treatment Effects by Cohort × Event Time\n'
+                    '(Pre-treatment ≈ 0 validates parallel trends)', 
+                    fontsize=12, fontweight='bold', pad=10)
+        
+        # Rotate labels for readability
+        ax.tick_params(axis='x', rotation=45, labelsize=9)
+        ax.tick_params(axis='y', rotation=0, labelsize=9)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+            print(f"✓ ATT heatmap saved to: {save_path}")
+        
+        if created_fig:
+            plt.show()
+    
+    # =========================================================================
+    # EFFECT MATRIX HEATMAP (Post-treatment only)
     # =========================================================================
     
     def plot_effect_matrix(
@@ -246,11 +399,12 @@ class CausalDashboard:
         annot: bool = True,
         save_path: Optional[str] = None,
         ax: Optional[plt.Axes] = None,
+        post_only: bool = False,
     ) -> None:
         """
         Plot cohort × relative time effect matrix as a heatmap.
         
-        Shows how treatment effects evolve for each cohort over time (M-x to M+y).
+        Shows how treatment effects evolve for each cohort over time.
         
         Parameters
         ----------
@@ -266,6 +420,8 @@ class CausalDashboard:
             Whether to annotate cells with values
         save_path : str, optional
             Path to save the figure
+        post_only : bool
+            If True, only show post-treatment periods (e >= 0)
         """
         matrix = self.analyzer.effect_matrix(pre_periods, post_periods, metric='att')
         
@@ -273,15 +429,21 @@ class CausalDashboard:
             print("No effect matrix data available")
             return
         
+        # Filter to post-treatment only if requested
+        if post_only:
+            post_cols = [c for c in matrix.columns if not c.startswith('e=-')]
+            matrix = matrix[post_cols]
+        
         # Auto-size based on matrix dimensions
         created_fig = False
         if ax is None:
             if figsize is None:
-                figsize = (max(12, len(matrix.columns) * 1.2), max(6, len(matrix) * 0.5))
+                n_cols = len(matrix.columns)
+                n_rows = len(matrix)
+                figsize = (max(10, min(18, n_cols * 1.0)), max(5, min(10, n_rows * 0.5)))
             fig, ax = plt.subplots(figsize=figsize)
             created_fig = True
         
-        # Create heatmap
         # Center colormap at 0
         vmax = max(abs(matrix.max().max()), abs(matrix.min().min()))
         vmin = -vmax
@@ -295,37 +457,34 @@ class CausalDashboard:
             vmax=vmax,
             annot=annot,
             fmt=',.0f',
-            annot_kws={'fontsize': 7},
+            annot_kws={'fontsize': 7 if len(matrix.columns) > 12 else 8},
             linewidths=0.5,
             linecolor='white',
             cbar_kws={'label': f'Effect on {self.analyzer.outcome_col}', 'shrink': 0.75}
         )
         
-        # Add vertical line at M+0
-        m0_idx = list(matrix.columns).index('M+0') if 'M+0' in matrix.columns else None
-        if m0_idx is not None:
-            ax.axvline(x=m0_idx, color='black', linewidth=2, linestyle='--')
+        # Add vertical line at e=0
+        if 'e=0' in matrix.columns:
+            e0_idx = list(matrix.columns).index('e=0')
+            ax.axvline(x=e0_idx, color='black', linewidth=2.5, linestyle='--', alpha=0.8)
         
-        ax.set_xlabel('Relative Time', fontsize=11)
+        ax.set_xlabel('Event Time', fontsize=11)
         ax.set_ylabel('Treatment Cohort', fontsize=11)
-        ax.set_title('Effect Matrix: Cohort × Time', fontsize=12, fontweight='bold')
         
-        # Add summary annotation
-        post_cols = [c for c in matrix.columns if c.startswith('M+')]
-        if post_cols:
-            post_mean = matrix[post_cols].mean().mean()
-            ax.text(
-                1.02, 0.5,
-                f'Post-treatment\nmean: {post_mean:,.0f}',
-                transform=ax.transAxes, fontsize=10, va='center',
-                bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8)
-            )
+        title = 'Effect Matrix: Cohort × Time'
+        if post_only:
+            title += ' (Post-Treatment Only)'
+        ax.set_title(title, fontsize=12, fontweight='bold')
+        
+        # Rotate labels for readability
+        ax.tick_params(axis='x', rotation=45, labelsize=9)
+        ax.tick_params(axis='y', rotation=0, labelsize=9)
         
         plt.tight_layout()
         
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
-            print(f"Effect matrix saved to: {save_path}")
+            print(f"✓ Effect matrix saved to: {save_path}")
         
         if created_fig:
             plt.show()
@@ -381,11 +540,12 @@ class CausalDashboard:
         
         y = range(len(het_df))
         
-        # Color by significance
+        # Color by significance (handle both 'pvalue' and 'p_value' column names)
+        pval_col = 'pvalue' if 'pvalue' in het_df.columns else 'p_value'
         colors = ['tab:green' if p < 0.05 and att > 0 
                   else 'tab:red' if p < 0.05 and att < 0 
                   else 'gray' 
-                  for p, att in zip(het_df['p_value'], het_df['att'])]
+                  for p, att in zip(het_df[pval_col], het_df['att'])]
         
         ax.barh(y, het_df['att'], color=colors, alpha=0.7, edgecolor='black')
         ax.errorbar(
@@ -421,7 +581,8 @@ class CausalDashboard:
             return np.nan
         return (m1 - m0) / pooled
     
-    def plot_love_plot(self, features: Optional[List[str]] = None, pre_only: bool = True, ax=None) -> None:
+    def plot_love_plot(self, features: Optional[List[str]] = None, pre_only: bool = True, 
+                       ax=None, max_features: int = 20, show_worst: bool = True) -> None:
         """
         Plot standardized mean differences (SMD) for selected numeric features.
         
@@ -432,6 +593,10 @@ class CausalDashboard:
         pre_only : bool
             If True, compute SMD on pre-treatment observations (relative_time < 0).
         ax : matplotlib axis, optional
+        max_features : int
+            Maximum number of features to display (shows worst balanced if exceeded)
+        show_worst : bool
+            If True and features exceed max_features, show worst balanced features
         """
         panel = self.analyzer.get_panel()
         data = panel[panel['relative_time'] < 0] if pre_only else panel
@@ -458,7 +623,8 @@ class CausalDashboard:
             smd = self._compute_smd(data, feat)
             smd_rows.append({'feature': feat, 'smd': smd})
         
-        smd_df = pd.DataFrame(smd_rows).dropna().sort_values('smd')
+        smd_df = pd.DataFrame(smd_rows).dropna()
+        
         if smd_df.empty:
             if ax is None:
                 print("No features available for SMD plot.")
@@ -466,25 +632,71 @@ class CausalDashboard:
                 ax.text(0.5, 0.5, 'No features available', ha='center', va='center')
             return
         
+        # Sort by absolute SMD (worst imbalance first)
+        smd_df['abs_smd'] = smd_df['smd'].abs()
+        smd_df = smd_df.sort_values('abs_smd', ascending=False)
+        
+        # Limit features if too many
+        n_total = len(smd_df)
+        truncated = False
+        if n_total > max_features and show_worst:
+            smd_df = smd_df.head(max_features)
+            truncated = True
+        
+        # Re-sort for display (ascending SMD for horizontal bar chart)
+        smd_df = smd_df.sort_values('smd', ascending=True)
+        
+        # Truncate long feature names for readability
+        smd_df['feature_display'] = smd_df['feature'].apply(
+            lambda x: x[:25] + '...' if len(x) > 28 else x
+        )
+        
         if ax is None:
-            fig, ax = plt.subplots(figsize=(7, max(4, len(smd_df) * 0.3)))
+            # Dynamic figure height based on number of features
+            fig_height = max(4, min(12, len(smd_df) * 0.35))
+            fig, ax = plt.subplots(figsize=(8, fig_height))
         
         y = range(len(smd_df))
-        ax.barh(y, smd_df['smd'], color='tab:blue', alpha=0.7, edgecolor='black')
-        ax.axvline(0, color='black', linestyle='-', alpha=0.5)
-        # Positive thresholds
-        ax.axvline(0.1, color='red', linestyle='--', alpha=0.5, label='SMD=±0.1')
-        ax.axvline(0.25, color='orange', linestyle=':', alpha=0.7, label='SMD=±0.25')
-        # Negative thresholds
-        ax.axvline(-0.1, color='red', linestyle='--', alpha=0.5)
-        ax.axvline(-0.25, color='orange', linestyle=':', alpha=0.7)
+        
+        # Color by balance quality
+        colors = ['#2E7D32' if abs(s) < 0.1 else '#FFA726' if abs(s) < 0.25 else '#C62828' 
+                  for s in smd_df['smd']]
+        
+        ax.barh(y, smd_df['smd'], color=colors, alpha=0.75, edgecolor='white', height=0.7)
+        ax.axvline(0, color='black', linestyle='-', alpha=0.5, linewidth=1)
+        
+        # Threshold lines
+        ax.axvline(0.1, color='#C62828', linestyle='--', alpha=0.4, linewidth=1.5, label='SMD=±0.1')
+        ax.axvline(0.25, color='#C62828', linestyle=':', alpha=0.6, linewidth=1.5, label='SMD=±0.25')
+        ax.axvline(-0.1, color='#C62828', linestyle='--', alpha=0.4, linewidth=1.5)
+        ax.axvline(-0.25, color='#C62828', linestyle=':', alpha=0.6, linewidth=1.5)
         
         ax.set_yticks(y)
-        ax.set_yticklabels(smd_df['feature'])
-        ax.set_xlabel('Standardized Mean Difference (SMD)')
-        ax.set_title('Balance Check', fontweight='bold')
-        ax.legend(loc='lower right', fontsize=8.5)
+        ax.set_yticklabels(smd_df['feature_display'], fontsize=8)
+        ax.set_xlabel('Standardized Mean Difference (SMD)', fontsize=10)
+        
+        # Title with truncation notice
+        title = 'Balance Check (Covariate SMD)'
+        if truncated:
+            title += f'\n(Top {max_features} worst-balanced of {n_total} features)'
+        ax.set_title(title, fontweight='bold', fontsize=11)
+        
+        # Legend with balance interpretation
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='#2E7D32', alpha=0.75, label='Good (|SMD| < 0.1)'),
+            Patch(facecolor='#FFA726', alpha=0.75, label='Moderate (0.1-0.25)'),
+            Patch(facecolor='#C62828', alpha=0.75, label='Poor (|SMD| > 0.25)'),
+        ]
+        ax.legend(handles=legend_elements, loc='lower right', fontsize=7.5, 
+                 framealpha=0.9, edgecolor='gray')
+        
         ax.grid(alpha=0.3, axis='x')
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        
+        # Tighten layout
+        plt.tight_layout()
     
     # =========================================================================
     # PARALLEL TRENDS
@@ -594,8 +806,8 @@ class CausalDashboard:
         )
         
         # ===== HEADER: Key Metrics =====
-        result = self.analyzer.estimate_did()
-        sig = '***' if result.p_value < 0.01 else '**' if result.p_value < 0.05 else '*' if result.p_value < 0.1 else ''
+        result = self.analyzer.estimate()
+        sig = result.significance_stars
         
         ax_header = fig.add_subplot(gs[0, :])
         ax_header.axis('off')
@@ -603,18 +815,19 @@ class CausalDashboard:
         # Title
         ax_header.text(
             0.5, 0.75, 
-            'Causal Inference Analysis Report',
+            'Staggered Causal Inference Report',
             ha='center', va='center', fontsize=22, fontweight='bold',
             transform=ax_header.transAxes
         )
         
         # Key metrics boxes
+        pretrend_status = '✓ Pass' if result.pretrend_passed else '✗ Fail'
         metrics_text = (
-            f"Average Treatment Effect: {result.att:,.0f} {sig}     "
-            f"95% CI: [{result.ci_lower:,.0f}, {result.ci_upper:,.0f}]     "
-            f"p-value: {result.p_value:.4f}     "
-            f"N Treated: {result.n_treated:,}     "
-            f"N Control: {result.n_control:,}"
+            f"Overall ATT: {result.overall_att:,.0f} {sig}     "
+            f"95% CI: [{result.overall_ci_lower:,.0f}, {result.overall_ci_upper:,.0f}]     "
+            f"p-value: {result.overall_pvalue:.4f}     "
+            f"N Pairs: {result.n_pairs:,}     "
+            f"Pre-trend: {pretrend_status}"
         )
         
         ax_header.text(
@@ -691,15 +904,15 @@ class CausalDashboard:
     def _plot_main_result_executive(self, ax, result):
         """Simplified ATT plot for executive report."""
         # Large bar with CI
-        color = '#2E7D32' if result.att > 0 else '#C62828'  # Professional green/red
+        color = '#2E7D32' if result.overall_att > 0 else '#C62828'  # Professional green/red
         
-        ax.barh([''], [result.att], color=color, alpha=0.75, height=0.5, 
+        ax.barh([''], [result.overall_att], color=color, alpha=0.75, height=0.5, 
                edgecolor='white', linewidth=2)
         
         # Error bars
         ax.errorbar(
-            result.att, 0,
-            xerr=[[result.att - result.ci_lower], [result.ci_upper - result.att]],
+            result.overall_att, 0,
+            xerr=[[result.overall_att - result.overall_ci_lower], [result.overall_ci_upper - result.overall_att]],
             fmt='o', color='#424242', capsize=10, capthick=2.5, markersize=11,
             elinewidth=2.5
         )
@@ -709,7 +922,7 @@ class CausalDashboard:
         
         # Clean styling
         ax.set_xlabel(f'{self.analyzer.outcome_col}', fontsize=12, fontweight='bold')
-        ax.set_title('Average Treatment Effect', fontsize=14, fontweight='bold', pad=12)
+        ax.set_title('Overall ATT (Staggered)', fontsize=14, fontweight='bold', pad=12)
         ax.tick_params(axis='y', which='both', left=False, labelleft=False)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
@@ -717,10 +930,10 @@ class CausalDashboard:
         ax.grid(axis='x', alpha=0.3, linestyle=':', linewidth=1)
         
         # Value annotation
-        sig = '***' if result.p_value < 0.01 else '**' if result.p_value < 0.05 else '*' if result.p_value < 0.1 else ''
+        sig = result.significance_stars
         ax.text(
-            result.att, 0.3,
-            f'{result.att:,.0f}{sig}',
+            result.overall_att, 0.3,
+            f'{result.overall_att:,.0f}{sig}',
             ha='center', va='center', fontsize=18, fontweight='bold',
             color=color, 
             bbox=dict(boxstyle='round,pad=0.5', facecolor='white', 
@@ -728,13 +941,18 @@ class CausalDashboard:
         )
     
     def _plot_effect_matrix_executive(self, ax):
-        """Cleaner effect matrix for executive report (M+0 to M+6)."""
+        """Cleaner effect matrix for executive report (e=0 to e=+6)."""
         try:
-            # effect_matrix() already returns a pivoted DataFrame (cohorts × time)
-            heatmap_data = self.analyzer.effect_matrix(pre_periods=0, post_periods=6)
+            # effect_matrix() returns a pivoted DataFrame (cohorts × time)
+            # Use pre_periods=1 to get e=-1 as reference, but we'll filter to e>=0
+            heatmap_data = self.analyzer.effect_matrix(pre_periods=1, post_periods=6)
             
             if heatmap_data.empty:
                 raise ValueError("No cohort event study data available")
+            
+            # Filter to only post-treatment (e >= 0)
+            post_cols = [c for c in heatmap_data.columns if not c.startswith('e=-')]
+            heatmap_data = heatmap_data[post_cols]
             
             # Sort cohorts descending for better visualization
             heatmap_data = heatmap_data.sort_index(ascending=False)
@@ -744,7 +962,6 @@ class CausalDashboard:
             vmin, vmax = -max_abs_val, max_abs_val
             
             # Professional diverging color scheme (red-white-green)
-            # Using RdYlGn_r for red=negative, green=positive
             cmap = 'RdYlGn'
             
             # Heatmap with cleaner annotations
@@ -761,8 +978,8 @@ class CausalDashboard:
             )
             
             # Clean labels
-            ax.set_title('Effect Matrix: Cohort × Time', fontsize=14, fontweight='bold', pad=12)
-            ax.set_xlabel('Months Relative to Treatment', fontsize=11, fontweight='bold')
+            ax.set_title('Effect Matrix: Cohort × Time (Post-Treatment)', fontsize=14, fontweight='bold', pad=12)
+            ax.set_xlabel('Event Time (e=0 is treatment)', fontsize=11, fontweight='bold')
             ax.set_ylabel('Treatment Cohort', fontsize=11, fontweight='bold')
             ax.tick_params(axis='both', labelsize=9.5)
             
@@ -777,22 +994,275 @@ class CausalDashboard:
             ax.axis('off')
     
     # =========================================================================
-    # QUICK SUMMARY
+    # FORMATTED OUTPUT METHODS
+    # =========================================================================
+    
+    def print_main_results(self, true_effect: Optional[float] = None) -> None:
+        """
+        Print formatted main ATT results.
+        
+        Parameters
+        ----------
+        true_effect : float, optional
+            If provided, shows comparison with true effect for validation
+        """
+        result = self.analyzer.estimate()
+        sig = result.significance_stars
+        
+        print("=" * 55)
+        print("MAIN RESULTS: Overall Average Treatment Effect (ATT)")
+        print("=" * 55)
+        print(f"  Overall ATT:      {result.overall_att:>12,.0f} {sig}")
+        print(f"  Standard Error:   {result.overall_se:>12,.2f}")
+        print(f"  95% CI:           [{result.overall_ci_lower:,.0f}, {result.overall_ci_upper:,.0f}]")
+        print(f"  p-value:          {result.overall_pvalue:>12.4f}")
+        if result.att_pct:
+            print(f"  Effect (% base):  {result.att_pct:>12.2%}")
+        print("-" * 55)
+        print(f"  N Matched Pairs:  {result.n_pairs:>12,}")
+        print(f"  N Treated Units:  {result.n_treated:>12,}")
+        print(f"  N Control Units:  {result.n_control:>12,}")
+        
+        if true_effect is not None:
+            print("-" * 55)
+            recovery_error = abs(result.overall_att - true_effect) / true_effect
+            print(f"  True Effect:      {true_effect:>12,.0f}")
+            print(f"  Recovery Error:   {recovery_error:>12.1%}")
+        
+        print("=" * 55)
+    
+    def print_pretrend_test(self) -> None:
+        """Print formatted pre-trend test results with interpretation."""
+        result = self.analyzer.estimate()
+        pretrend = result.pretrend_test
+        
+        print("=" * 55)
+        print("PRE-TREND TEST (Parallel Trends Diagnostic)")
+        print("=" * 55)
+        print(f"  Test Type:        Joint Wald test on lead coefficients")
+        print(f"  Wald Statistic:   {pretrend.get('statistic', 0):>12.2f}")
+        print(f"  Degrees of Freedom: {pretrend.get('df', 0):>10}")
+        print(f"  p-value:          {pretrend.get('pvalue', 1):>12.4f}")
+        print("-" * 55)
+        
+        passed = pretrend.get('passed', False)
+        if passed:
+            print("  Result:           ✓ PASS (p > 0.05)")
+            print("-" * 55)
+            print("  Interpretation:")
+            print("    We CANNOT reject H₀ that pre-treatment effects = 0.")
+            print("    This supports the parallel trends assumption.")
+        else:
+            print("  Result:           ✗ FAIL (p < 0.05)")
+            print("-" * 55)
+            print("  Interpretation:")
+            print("    We REJECT H₀ - pre-treatment effects differ from 0.")
+            print("    ⚠️ Potential violation of parallel trends assumption.")
+        
+        print("=" * 55)
+    
+    def print_cohort_summary(self, true_effect: Optional[float] = None) -> None:
+        """
+        Print formatted summary of cohort effects.
+        
+        Parameters
+        ----------
+        true_effect : float, optional
+            If provided, shows comparison with true effect
+        """
+        cohort_df = self.analyzer.effect_by_cohort()
+        
+        if len(cohort_df) == 0:
+            print("No cohort data available")
+            return
+        
+        print("=" * 55)
+        print("COHORT EFFECTS: Treatment Effect Heterogeneity")
+        print("=" * 55)
+        print(f"  Number of Cohorts:     {len(cohort_df):>10}")
+        print(f"  Mean ATT:              {cohort_df['att'].mean():>10,.0f}")
+        print(f"  Std ATT:               {cohort_df['att'].std():>10,.0f}")
+        print(f"  Min ATT:               {cohort_df['att'].min():>10,.0f}")
+        print(f"  Max ATT:               {cohort_df['att'].max():>10,.0f}")
+        
+        # Count significant cohorts
+        pval_col = 'pvalue' if 'pvalue' in cohort_df.columns else 'p_value'
+        n_sig = (cohort_df[pval_col] < 0.05).sum()
+        print(f"  Significant (p<0.05):  {n_sig:>10} / {len(cohort_df)}")
+        
+        if true_effect is not None:
+            print("-" * 55)
+            print(f"  True Effect:           {true_effect:>10,.0f}")
+        
+        print("=" * 55)
+    
+    def print_reconciliation(self, pre_periods: int = 6, post_periods: int = 12) -> None:
+        """
+        Print reconciliation check: overall ATT vs weighted cell average.
+        
+        This validates that the overall ATT equals the weighted average
+        of the ATT(g,t) table's post-treatment cells.
+        """
+        result = self.analyzer.estimate(pre_periods=pre_periods, post_periods=post_periods)
+        att_gt = self.analyzer.get_att_table(pre_periods=pre_periods, post_periods=post_periods)
+        
+        # Filter to post-treatment
+        post = att_gt[att_gt['relative_time'] >= 0].copy()
+        
+        # Manual weighted average
+        weights = post['n_pairs'].values
+        manual_att = np.average(post['att'].values, weights=weights)
+        
+        diff = abs(result.overall_att - manual_att)
+        passed = diff < 0.01
+        
+        print("=" * 55)
+        print("RECONCILIATION CHECK")
+        print("=" * 55)
+        print(f"  Overall ATT (reported):     {result.overall_att:>12,.2f}")
+        print(f"  Weighted avg of cells:      {manual_att:>12,.2f}")
+        print(f"  Difference:                 {diff:>12.6f}")
+        print("-" * 55)
+        print(f"  Result:  {'✓ PASS' if passed else '✗ FAIL'} (difference {'<' if passed else '≥'} 0.01)")
+        print("=" * 55)
+    
+    def print_robustness(self, pre_periods: int = 6, post_periods: int = 12,
+                        true_effect: Optional[float] = None) -> None:
+        """
+        Print robustness check comparing primary and stacked DiD estimators.
+        
+        Parameters
+        ----------
+        pre_periods : int
+            Number of pre-treatment periods
+        post_periods : int
+            Number of post-treatment periods
+        true_effect : float, optional
+            If provided, shows comparison with true effect
+        """
+        result = self.analyzer.estimate(
+            pre_periods=pre_periods, 
+            post_periods=post_periods, 
+            robustness=True
+        )
+        
+        print("=" * 55)
+        print("ROBUSTNESS CHECK: Primary vs Stacked DiD")
+        print("=" * 55)
+        print(f"  Primary ATT:        {result.overall_att:>12,.0f}")
+        
+        if hasattr(result, 'robustness') and result.robustness:
+            stacked_att = result.robustness.get('overall_att', np.nan)
+            print(f"  Stacked DiD ATT:    {stacked_att:>12,.0f}")
+            
+            diff_pct = abs(result.overall_att - stacked_att) / abs(result.overall_att) * 100
+            print(f"  Difference:         {diff_pct:>12.1f}%")
+            
+            if true_effect is not None:
+                print("-" * 55)
+                print(f"  True Effect:        {true_effect:>12,.0f}")
+            
+            print("-" * 55)
+            if diff_pct < 20:
+                print("  Result: ✓ PASS - Estimates are consistent (<20% difference)")
+            else:
+                print("  Result: ⚠️ WARNING - Estimates differ substantially (≥20%)")
+        else:
+            print("  Stacked DiD:        Not available")
+        
+        print("=" * 55)
+    
+    # =========================================================================
+    # QUICK SUMMARY TABLE
     # =========================================================================
     
     def summary_table(self) -> pd.DataFrame:
         """Return DataFrame with summary statistics."""
-        result = self.analyzer.estimate_did()
+        result = self.analyzer.estimate()
         cohorts = self.analyzer.effect_by_cohort()
         
-        return pd.DataFrame([
-            {'Metric': 'ATT (Main Effect)', 'Value': f'{result.att:,.0f}'},
-            {'Metric': '95% CI Lower', 'Value': f'{result.ci_lower:,.0f}'},
-            {'Metric': '95% CI Upper', 'Value': f'{result.ci_upper:,.0f}'},
-            {'Metric': 'p-value', 'Value': f'{result.p_value:.4f}'},
+        rows = [
+            {'Metric': 'Overall ATT', 'Value': f'{result.overall_att:,.0f}'},
+            {'Metric': '95% CI Lower', 'Value': f'{result.overall_ci_lower:,.0f}'},
+            {'Metric': '95% CI Upper', 'Value': f'{result.overall_ci_upper:,.0f}'},
+            {'Metric': 'p-value', 'Value': f'{result.overall_pvalue:.4f}'},
             {'Metric': 'Effect as % of Baseline', 'Value': f'{result.att_pct:.2%}' if result.att_pct else 'N/A'},
             {'Metric': 'N Treated', 'Value': f'{result.n_treated:,}'},
             {'Metric': 'N Control', 'Value': f'{result.n_control:,}'},
+            {'Metric': 'N Pairs', 'Value': f'{result.n_pairs:,}'},
             {'Metric': 'N Cohorts', 'Value': f'{len(cohorts)}'},
-            {'Metric': 'ATT Std Across Cohorts', 'Value': f'{cohorts["att"].std():,.0f}' if len(cohorts) > 0 else 'N/A'},
-        ])
+            {'Metric': 'Pre-trend Test', 'Value': 'PASS' if result.pretrend_passed else 'FAIL'},
+        ]
+        
+        if len(cohorts) > 1:
+            rows.append({'Metric': 'ATT Std Across Cohorts', 'Value': f'{cohorts["att"].std():,.0f}'})
+        
+        return pd.DataFrame(rows)
+
+
+# =============================================================================
+# CONVENIENCE FUNCTION
+# =============================================================================
+
+if __name__ == "__main__":
+    # Demo with sample data
+    import sys
+    import os
+    sys.path.append(os.path.abspath("."))
+    sys.path.append(os.path.abspath("src"))
+    
+    from sample_data import generate_sample_data
+    from src.matching import PropensityMatcher
+    from src.causal_analyzer import CausalAnalyzer
+    from src.propensity_model import CausalPropensityScore
+    
+    print("Generating sample data...")
+    data = generate_sample_data(
+        n_accounts=3000,
+        n_treatment_accounts=300,
+        treatment_effect=15000,
+        noise_scale=3000,
+        selection_mode='balanced'
+    )
+    
+    df = data['feature_store']
+    df_treat = data['treatment_table']
+    
+    # Prepare data
+    units = df.groupby('cod_conta').first().reset_index()
+    df_treat['matching_cohort'] = df_treat['treatment_date'].dt.strftime('%Y%m').astype(int)
+    units = units.merge(df_treat[['cod_conta', 'matching_cohort']], on='cod_conta', how='left')
+    units['ever_treated'] = units['matching_cohort'].notnull().astype(int)
+    
+    # Propensity Score
+    print("Fitting propensity model...")
+    X = units[['cod_conta', 'val_cap_liq', 'potencial', 'n_acessos_hub']].copy()
+    y = units['ever_treated']
+    ps = CausalPropensityScore(id_col='cod_conta')
+    scores = ps.fit_predict_honest(X, y)
+    units = units.merge(scores, on='cod_conta')
+    
+    # Matching
+    print("Matching...")
+    matcher = PropensityMatcher(use_caliper=True)
+    matched = matcher.match(units, 'ever_treated', 'cod_conta', 'propensity_score', 'matching_cohort')
+    
+    # Create dashboard
+    print("Creating dashboard...")
+    analyzer = CausalAnalyzer(matched, df, 'val_cap_liq', 'num_ano_mes', 'cod_conta')
+    dashboard = CausalDashboard(analyzer)
+    
+    # Run validation
+    analyzer.validate()
+    
+    # Generate full report
+    print("\nGenerating full visual report...")
+    dashboard.full_report(
+        heterogeneity_features=['segmento'],
+        true_effect=15000,
+        save_path='causal_analysis_report.png'
+    )
+    
+    # Print summary
+    print("\nSummary Table:")
+    print(dashboard.summary_table().to_string(index=False))
