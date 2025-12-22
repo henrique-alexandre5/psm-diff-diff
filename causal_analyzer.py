@@ -606,18 +606,46 @@ class CausalAnalyzer:
         
         return pd.DataFrame(results)
     
-    def _get_pretreatment_features(self, feature_col: str) -> pd.DataFrame:
-        """Get feature values at pre-treatment (matching cohort) time."""
+    def _get_pretreatment_features(self, feature_col: str, months_before: int = 1) -> pd.DataFrame:
+        """
+        Get feature values BEFORE treatment (e.g., e=-1).
+        
+        Parameters
+        ----------
+        feature_col : str
+            Column name of the feature
+        months_before : int
+            Number of months before treatment to get the value (default: 1 = e=-1)
+        
+        Returns
+        -------
+        pd.DataFrame
+            DataFrame with id_col and feature values at pre-treatment time
+        """
         # Get (id, cohort) pairs from matched data
         treated_cohorts = self.matched_df[['treated_id', 'matching_cohort']].copy()
         treated_cohorts.columns = [self.id_col, 'cohort']
         
-        # Join with outcome data to get feature at cohort time
+        # Calculate the pre-treatment time (e.g., 1 month before cohort)
+        # Convert YYYYMM to pre-treatment YYYYMM
+        def subtract_months(yyyymm: int, n_months: int) -> int:
+            year = yyyymm // 100
+            month = yyyymm % 100
+            total_months = year * 12 + month - 1 - n_months
+            new_year = total_months // 12
+            new_month = total_months % 12 + 1
+            return new_year * 100 + new_month
+        
+        treated_cohorts['pre_treatment_time'] = treated_cohorts['cohort'].apply(
+            lambda x: subtract_months(int(x), months_before)
+        )
+        
+        # Join with outcome data to get feature at PRE-TREATMENT time
         feature_data = self.outcome_df[[self.id_col, self.time_col, feature_col]].copy()
         
         merged = treated_cohorts.merge(
             feature_data,
-            left_on=[self.id_col, 'cohort'],
+            left_on=[self.id_col, 'pre_treatment_time'],
             right_on=[self.id_col, self.time_col],
             how='left'
         )
