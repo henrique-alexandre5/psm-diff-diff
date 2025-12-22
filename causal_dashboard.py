@@ -509,7 +509,8 @@ class CausalDashboard:
     # HETEROGENEOUS EFFECTS
     # =========================================================================
     
-    def plot_heterogeneous_effects(self, features: List[str], ax=None) -> None:
+    def plot_heterogeneous_effects(self, features: List[str], ax=None, 
+                                    show_table: bool = False) -> Optional[pd.DataFrame]:
         """
         Plot treatment effects by subgroups (heterogeneous treatment effects).
         
@@ -517,6 +518,14 @@ class CausalDashboard:
         ----------
         features : list
             List of column names to analyze (e.g., ['segmento', 'region'])
+        ax : matplotlib axis, optional
+        show_table : bool
+            If True, return the data table for display
+        
+        Returns
+        -------
+        pd.DataFrame or None
+            If show_table=True, returns the heterogeneity data
         """
         all_results = []
         
@@ -530,7 +539,7 @@ class CausalDashboard:
         
         if not all_results:
             print("No heterogeneity data available")
-            return
+            return None
         
         het_df = pd.concat(all_results, ignore_index=True)
         het_df = het_df.sort_values('att', ascending=True)
@@ -564,6 +573,53 @@ class CausalDashboard:
         ax.grid(alpha=0.3, axis='x')
         
         plt.tight_layout()
+        
+        if show_table:
+            return het_df
+        return None
+    
+    def get_heterogeneous_effects_table(self, features: List[str]) -> pd.DataFrame:
+        """
+        Get heterogeneous effects as a formatted table.
+        
+        Parameters
+        ----------
+        features : list
+            List of column names to analyze
+        
+        Returns
+        -------
+        pd.DataFrame
+            Formatted table with ATT, SE, CI, p-value, N for each subgroup
+        """
+        all_results = []
+        
+        for feature in features:
+            try:
+                res = self.analyzer.effect_by_subgroup(filter_col=feature)
+                res['feature'] = feature
+                all_results.append(res)
+            except Exception:
+                continue
+        
+        if not all_results:
+            return pd.DataFrame()
+        
+        het_df = pd.concat(all_results, ignore_index=True)
+        
+        # Format for display
+        pval_col = 'pvalue' if 'pvalue' in het_df.columns else 'p_value'
+        display_df = pd.DataFrame({
+            'Subgroup': het_df['subgroup'],
+            'ATT': het_df['att'].apply(lambda x: f'{x:,.0f}'),
+            'SE': het_df['se'].apply(lambda x: f'{x:,.0f}'),
+            '95% CI': het_df.apply(lambda r: f"[{r['ci_lower']:,.0f}, {r['ci_upper']:,.0f}]", axis=1),
+            'p-value': het_df[pval_col].apply(lambda x: f'{x:.4f}' if x >= 0.0001 else '<0.0001'),
+            'N Pairs': het_df['n_pairs'].apply(lambda x: f'{x:,}'),
+            'Sig': het_df[pval_col].apply(lambda x: '***' if x < 0.01 else '**' if x < 0.05 else '*' if x < 0.1 else '')
+        })
+        
+        return display_df.sort_values('ATT', key=lambda x: x.str.replace(',', '').astype(float), ascending=False)
 
     # =========================================================================
     # LOVE PLOT (SMD)
@@ -879,19 +935,24 @@ class CausalDashboard:
         # Effect matrix (M+0 to M+6, cleaner annotations)
         self._plot_effect_matrix_executive(ax7)
         
-        # ===== ROW 5: Heterogeneity =====
+        # ===== ROW 5: Heterogeneity + Event Study Table =====
         ax8 = fig.add_subplot(gs[5, 0])
         ax9 = fig.add_subplot(gs[5, 1])
-        ax9.axis('off')  # Right side empty for balance
         
         if heterogeneity_features:
             self.plot_heterogeneous_effects(heterogeneity_features, ax=ax8)
             ax8.set_title('Heterogeneous Treatment Effects', fontsize=14, fontweight='bold', pad=12)
+            
+            # Add heterogeneity table in ax9
+            self._plot_heterogeneity_table(heterogeneity_features, ax9)
         else:
             ax8.text(0.5, 0.5, 'Heterogeneous effects analysis\n(specify features to enable)', 
                     ha='center', va='center', fontsize=12, color='#888888', style='italic')
             ax8.set_title('Heterogeneous Treatment Effects', fontsize=14, fontweight='bold', pad=12)
             ax8.axis('off')
+            
+            # Show event study table instead
+            self._plot_event_study_table(ax9)
         
         # Save
         if save_path:
@@ -939,6 +1000,108 @@ class CausalDashboard:
             bbox=dict(boxstyle='round,pad=0.5', facecolor='white', 
                      edgecolor=color, linewidth=2, alpha=0.95)
         )
+    
+    def _plot_event_study_table(self, ax) -> None:
+        """Plot event study numbers as a table in the report."""
+        ax.axis('off')
+        
+        try:
+            es = self.analyzer.estimate_event_study(pre_periods=6, post_periods=6)
+            post = es[es['relative_time'] >= 0].copy()
+            
+            if post.empty:
+                ax.text(0.5, 0.5, 'No event study data', ha='center', va='center')
+                return
+            
+            # Build table data
+            table_data = []
+            for _, row in post.iterrows():
+                t = int(row['relative_time'])
+                sig = '***' if row['pvalue'] < 0.01 else '**' if row['pvalue'] < 0.05 else '*' if row['pvalue'] < 0.1 else ''
+                table_data.append([
+                    f"M+{t}",
+                    f"{row['att']:,.0f}{sig}",
+                    f"[{row['ci_lower']:,.0f}, {row['ci_upper']:,.0f}]"
+                ])
+            
+            table = ax.table(
+                cellText=table_data,
+                colLabels=['Time', 'ATT', '95% CI'],
+                loc='center',
+                cellLoc='center',
+                colWidths=[0.2, 0.35, 0.45]
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(9)
+            table.scale(1.2, 1.4)
+            
+            # Style header
+            for j in range(3):
+                table[(0, j)].set_facecolor('#E8E8E8')
+                table[(0, j)].set_text_props(fontweight='bold')
+            
+            ax.set_title('Event Study: Effects by Month\n(Aggregated Across Cohorts)', 
+                        fontsize=12, fontweight='bold', pad=8)
+            
+        except Exception as e:
+            ax.text(0.5, 0.5, f'Event study table unavailable\n({str(e)})', 
+                   ha='center', va='center', fontsize=10, color='gray')
+    
+    def _plot_heterogeneity_table(self, features: List[str], ax) -> None:
+        """Plot heterogeneity numbers as a table in the report."""
+        ax.axis('off')
+        
+        try:
+            all_results = []
+            for feature in features:
+                try:
+                    res = self.analyzer.effect_by_subgroup(filter_col=feature)
+                    res['feature'] = feature
+                    all_results.append(res)
+                except Exception:
+                    continue
+            
+            if not all_results:
+                ax.text(0.5, 0.5, 'No heterogeneity data', ha='center', va='center')
+                return
+            
+            het_df = pd.concat(all_results, ignore_index=True)
+            pval_col = 'pvalue' if 'pvalue' in het_df.columns else 'p_value'
+            het_df = het_df.sort_values('att', ascending=False).head(8)  # Top 8
+            
+            # Build table data
+            table_data = []
+            for _, row in het_df.iterrows():
+                sig = '***' if row[pval_col] < 0.01 else '**' if row[pval_col] < 0.05 else '*' if row[pval_col] < 0.1 else ''
+                subgroup = str(row['subgroup'])[:20]  # Truncate
+                table_data.append([
+                    subgroup,
+                    f"{row['att']:,.0f}{sig}",
+                    f"{row['n_pairs']:,}"
+                ])
+            
+            table = ax.table(
+                cellText=table_data,
+                colLabels=['Subgroup', 'ATT', 'N'],
+                loc='center',
+                cellLoc='center',
+                colWidths=[0.5, 0.3, 0.2]
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(9)
+            table.scale(1.2, 1.3)
+            
+            # Style header
+            for j in range(3):
+                table[(0, j)].set_facecolor('#E8E8E8')
+                table[(0, j)].set_text_props(fontweight='bold')
+            
+            ax.set_title('Heterogeneous Effects Summary\n(Top Subgroups by Effect Size)', 
+                        fontsize=12, fontweight='bold', pad=8)
+            
+        except Exception as e:
+            ax.text(0.5, 0.5, f'Heterogeneity table unavailable\n({str(e)})', 
+                   ha='center', va='center', fontsize=10, color='gray')
     
     def _plot_effect_matrix_executive(self, ax):
         """Cleaner effect matrix for executive report (e=0 to e=+6)."""
@@ -1125,6 +1288,96 @@ class CausalDashboard:
         print("-" * 55)
         print(f"  Result:  {'✓ PASS' if passed else '✗ FAIL'} (difference {'<' if passed else '≥'} 0.01)")
         print("=" * 55)
+    
+    def print_event_study_table(self, pre_periods: int = 6, post_periods: int = 12,
+                                 post_only: bool = True) -> None:
+        """
+        Print aggregated event study effects by relative time (M+0, M+1, M+2...).
+        
+        Parameters
+        ----------
+        pre_periods : int
+            Number of pre-treatment periods
+        post_periods : int
+            Number of post-treatment periods
+        post_only : bool
+            If True, only show post-treatment periods (e >= 0)
+        """
+        es = self.analyzer.estimate_event_study(pre_periods, post_periods)
+        
+        if post_only:
+            es = es[es['relative_time'] >= 0].copy()
+        
+        print("=" * 70)
+        print("EVENT STUDY: Aggregated Effects by Relative Time")
+        print("=" * 70)
+        print(f"{'Time':>8} {'ATT':>12} {'SE':>10} {'95% CI':>24} {'p-value':>10} {'Sig':>5}")
+        print("-" * 70)
+        
+        for _, row in es.iterrows():
+            t = int(row['relative_time'])
+            time_label = f"M+{t}" if t >= 0 else f"M{t}"
+            ci_str = f"[{row['ci_lower']:,.0f}, {row['ci_upper']:,.0f}]"
+            sig = '***' if row['pvalue'] < 0.01 else '**' if row['pvalue'] < 0.05 else '*' if row['pvalue'] < 0.1 else ''
+            print(f"{time_label:>8} {row['att']:>12,.0f} {row['se']:>10,.0f} {ci_str:>24} {row['pvalue']:>10.4f} {sig:>5}")
+        
+        print("=" * 70)
+        
+        # Summary statistics for post-treatment
+        post = es[es['relative_time'] >= 0]
+        if len(post) > 0:
+            mean_att = post['att'].mean()
+            min_att = post['att'].min()
+            max_att = post['att'].max()
+            print(f"Post-treatment summary: Mean={mean_att:,.0f}, Min={min_att:,.0f}, Max={max_att:,.0f}")
+    
+    def print_heterogeneous_effects(self, features: List[str]) -> None:
+        """
+        Print heterogeneous effects table with all numerical values.
+        
+        Parameters
+        ----------
+        features : list
+            List of column names to analyze
+        """
+        all_results = []
+        
+        for feature in features:
+            try:
+                res = self.analyzer.effect_by_subgroup(filter_col=feature)
+                res['feature'] = feature
+                all_results.append(res)
+            except Exception as e:
+                print(f"Warning: Could not analyze {feature}: {e}")
+                continue
+        
+        if not all_results:
+            print("No heterogeneity data available")
+            return
+        
+        het_df = pd.concat(all_results, ignore_index=True)
+        pval_col = 'pvalue' if 'pvalue' in het_df.columns else 'p_value'
+        
+        # Sort by ATT descending
+        het_df = het_df.sort_values('att', ascending=False)
+        
+        print("=" * 85)
+        print("HETEROGENEOUS TREATMENT EFFECTS BY SUBGROUP")
+        print("=" * 85)
+        print(f"{'Subgroup':>25} {'ATT':>12} {'SE':>10} {'95% CI':>24} {'p-value':>10} {'N':>8}")
+        print("-" * 85)
+        
+        for _, row in het_df.iterrows():
+            ci_str = f"[{row['ci_lower']:,.0f}, {row['ci_upper']:,.0f}]"
+            sig = '***' if row[pval_col] < 0.01 else '**' if row[pval_col] < 0.05 else '*' if row[pval_col] < 0.1 else ''
+            subgroup = row['subgroup'][:25]  # Truncate long names
+            print(f"{subgroup:>25} {row['att']:>12,.0f}{sig:>3} {row['se']:>7,.0f} {ci_str:>24} {row[pval_col]:>10.4f} {row['n_pairs']:>8,}")
+        
+        print("=" * 85)
+        
+        # Summary
+        n_sig = (het_df[pval_col] < 0.05).sum()
+        print(f"Summary: {n_sig}/{len(het_df)} subgroups with significant effects (p < 0.05)")
     
     def print_robustness(self, pre_periods: int = 6, post_periods: int = 12,
                         true_effect: Optional[float] = None) -> None:
