@@ -147,8 +147,17 @@ class StaggeredDiD:
         Name of time column (YYYYMM format)
     id_col : str
         Name of unit ID column
-    baseline_relative_time : int
-        Reference period for DiD (default: -1, one period before treatment)
+    use_all_preperiods_baseline : bool
+        If True (default), uses average of pre-treatment periods as baseline.
+        If False, uses only the e=-1 period as baseline.
+    baseline_max_periods : int, optional
+        Maximum number of pre-treatment periods to use for baseline.
+        Default is 12 (e=-12 to e=-1). This limits how far back the baseline
+        calculation goes, which is recommended because:
+        - Avoids structural breaks in distant past
+        - Focuses on period closest to treatment
+        - Reduces noise from very old data
+        Set to None to use ALL available pre-treatment periods.
     """
     
     def __init__(
@@ -158,14 +167,16 @@ class StaggeredDiD:
         outcome_col: str = 'val_cap_liq',
         time_col: str = 'num_ano_mes',
         id_col: str = 'cod_conta',
-        baseline_relative_time: int = -1,
+        use_all_preperiods_baseline: bool = True,
+        baseline_max_periods: Optional[int] = 12,
     ):
         self.matched_df = matched_df.copy()
         self.outcome_df = outcome_df.copy()
         self.outcome_col = outcome_col
         self.time_col = time_col
         self.id_col = id_col
-        self.baseline_relative_time = baseline_relative_time
+        self.use_all_preperiods_baseline = use_all_preperiods_baseline
+        self.baseline_max_periods = baseline_max_periods
         
         # Ensure matching_cohort column exists
         if 'matching_cohort' not in self.matched_df.columns:
@@ -232,25 +243,62 @@ class StaggeredDiD:
         
         return pair_outcomes
     
-    def _compute_pair_level_did(self, pair_outcomes: pd.DataFrame) -> pd.DataFrame:
+    def _compute_pair_level_did(self, pair_outcomes: pd.DataFrame, baseline_periods: Optional[int] = None) -> pd.DataFrame:
         """
         Compute pair-level DiD for each (pair, relative_time).
         
         For each pair, computes:
         DID = (Y_treated(t) - Y_treated(baseline)) - (Y_control(t) - Y_control(baseline))
         
+        Baseline can be:
+        - Average of all pre-treatment periods (use_all_preperiods_baseline=True, default)
+        - Single period at e=-1 (use_all_preperiods_baseline=False)
+        
+        Parameters
+        ----------
+        pair_outcomes : pd.DataFrame
+            Pair-level outcome data with relative_time
+        baseline_periods : int, optional
+            Number of pre-treatment periods to use for baseline averaging.
+            If None (default), uses ALL available pre-treatment periods.
+            This is separate from display pre_periods to ensure consistent estimates.
+        
+        Using all pre-treatment periods is more robust as it:
+        - Reduces noise from any single period
+        - Captures average pre-treatment level more accurately
+        - Is less sensitive to outliers
+        
         Returns DataFrame with pair_id, cohort, relative_time, did_effect
         """
-        baseline_e = self.baseline_relative_time
-        
-        # Get baseline outcomes for each pair
-        baseline = pair_outcomes[pair_outcomes['relative_time'] == baseline_e][
-            ['pair_id', 'y_treated', 'y_control']
-        ].copy()
-        baseline = baseline.rename(columns={
-            'y_treated': 'y_treated_baseline',
-            'y_control': 'y_control_baseline'
-        })
+        if self.use_all_preperiods_baseline:
+            # Use average of pre-treatment periods as baseline
+            # Determine the window for baseline calculation
+            effective_baseline_periods = baseline_periods or self.baseline_max_periods
+            
+            if effective_baseline_periods is None:
+                # Use ALL available pre-treatment periods
+                pre_data = pair_outcomes[pair_outcomes['relative_time'] < 0]
+            else:
+                # Use specified number of pre-periods (e.g., e=-12 to e=-1)
+                pre_data = pair_outcomes[
+                    (pair_outcomes['relative_time'] < 0) & 
+                    (pair_outcomes['relative_time'] >= -effective_baseline_periods)
+                ]
+            baseline = pre_data.groupby('pair_id').agg(
+                y_treated_baseline=('y_treated', 'mean'),
+                y_control_baseline=('y_control', 'mean'),
+                n_pre_periods=('y_treated', 'count')
+            ).reset_index()
+        else:
+            # Use single period (e=-1) as baseline
+            baseline = pair_outcomes[pair_outcomes['relative_time'] == -1][
+                ['pair_id', 'y_treated', 'y_control']
+            ].copy()
+            baseline = baseline.rename(columns={
+                'y_treated': 'y_treated_baseline',
+                'y_control': 'y_control_baseline'
+            })
+            baseline['n_pre_periods'] = 1
         
         # Merge baseline with all periods
         did_data = pair_outcomes.merge(baseline, on='pair_id', how='inner')
@@ -274,6 +322,7 @@ class StaggeredDiD:
         self,
         pre_periods: int = 6,
         post_periods: int = 12,
+        baseline_periods: Optional[int] = None,
     ) -> pd.DataFrame:
         """
         Compute ATT(g,t) for each cohort and relative time.
@@ -281,25 +330,38 @@ class StaggeredDiD:
         Parameters
         ----------
         pre_periods : int
-            Number of pre-treatment periods to include
+            Number of pre-treatment periods to DISPLAY (for output/visualization)
         post_periods : int
-            Number of post-treatment periods to include
+            Number of post-treatment periods to DISPLAY
+        baseline_periods : int, optional
+            Number of pre-treatment periods to use for baseline calculation.
+            If None (default), uses ALL available pre-treatment periods.
+            This ensures consistent estimates regardless of display settings.
         
         Returns
         -------
         pd.DataFrame
             Columns: cohort, relative_time, att, se, ci_lower, ci_upper, pvalue, n_pairs
+        
+        Notes
+        -----
+        The baseline is computed INDEPENDENTLY of pre_periods to ensure estimates
+        are consistent. When use_all_preperiods_baseline=True (default), the baseline
+        is the average of ALL pre-treatment periods, providing the most robust estimate.
+        
+        Changing pre_periods only affects which periods are displayed, NOT the estimates.
         """
         # Build pair-level data
         pair_outcomes = self._build_pair_outcomes()
-        pair_did = self._compute_pair_level_did(pair_outcomes)
+        # Baseline uses all available pre-periods (or baseline_periods if specified)
+        # This is separate from display pre_periods to ensure consistent estimates
+        pair_did = self._compute_pair_level_did(pair_outcomes, baseline_periods=baseline_periods)
         self._pair_level_did = pair_did
         
-        # Filter to time window
+        # Filter to time window (include all pre-periods and post-periods)
         pair_did = pair_did[
             (pair_did['relative_time'] >= -pre_periods) &
-            (pair_did['relative_time'] <= post_periods) &
-            (pair_did['relative_time'] != self.baseline_relative_time)  # Exclude baseline
+            (pair_did['relative_time'] <= post_periods)
         ].copy()
         
         # Aggregate by (cohort, relative_time)
@@ -316,19 +378,6 @@ class StaggeredDiD:
         att_gt['ci_upper'] = att_gt['att'] + 1.96 * att_gt['se']
         att_gt['pvalue'] = 2 * (1 - stats.norm.cdf(np.abs(att_gt['att'] / att_gt['se'].replace(0, np.nan))))
         
-        # Add baseline period with ATT=0 by construction
-        cohorts = att_gt['cohort'].unique()
-        baseline_rows = pd.DataFrame({
-            'cohort': cohorts,
-            'relative_time': self.baseline_relative_time,
-            'att': 0.0,
-            'se': 0.0,
-            'ci_lower': 0.0,
-            'ci_upper': 0.0,
-            'pvalue': 1.0,
-            'n_pairs': att_gt.groupby('cohort')['n_pairs'].first().values
-        })
-        att_gt = pd.concat([att_gt, baseline_rows], ignore_index=True)
         att_gt = att_gt.sort_values(['cohort', 'relative_time']).reset_index(drop=True)
         
         self._att_gt = att_gt
@@ -417,9 +466,8 @@ class StaggeredDiD:
         if att_gt is None:
             raise ValueError("Must call compute_att_gt() first or provide att_gt")
         
-        # Filter to post-treatment only (relative_time >= 0, excluding baseline)
-        post = att_gt[att_gt['relative_time'] > self.baseline_relative_time].copy()
-        post = post[post['relative_time'] >= 0]  # Post-treatment
+        # Filter to post-treatment only (relative_time >= 0)
+        post = att_gt[att_gt['relative_time'] >= 0].copy()
         
         if len(post) == 0:
             return {
@@ -502,9 +550,6 @@ class StaggeredDiD:
         
         if lead_periods is not None:
             pre = pre[pre['relative_time'] >= -lead_periods]
-        
-        # Exclude baseline
-        pre = pre[pre['relative_time'] != self.baseline_relative_time]
         
         if len(pre) == 0 or pre['se'].isna().all():
             return {
@@ -675,14 +720,24 @@ class StackedDiD:
         self,
         pre_periods: int = 6,
         post_periods: int = 12,
-        baseline_relative_time: int = -1,
+        use_all_preperiods_baseline: bool = True,
     ) -> Dict:
         """
         Compute stacked DiD event study for robustness.
         
-        For each cohort, constructs a clean 2×2 comparison using:
-        - Pre-period: baseline_relative_time
+        For each cohort, constructs a clean comparison using:
+        - Baseline: Average of all pre-treatment periods (default) or single e=-1 period
         - Post-periods: 0 to post_periods
+        
+        Parameters
+        ----------
+        pre_periods : int
+            Number of pre-treatment periods
+        post_periods : int
+            Number of post-treatment periods
+        use_all_preperiods_baseline : bool
+            If True (default), uses average of all pre-treatment periods as baseline.
+            If False, uses only the e=-1 period.
         
         Returns
         -------
@@ -710,25 +765,35 @@ class StackedDiD:
                 treated_data['relative_time'] = self._month_diff(cohort, treated_data[self.time_col])
                 control_data['relative_time'] = self._month_diff(cohort, control_data[self.time_col])
                 
-                # Get baseline values
-                treated_baseline = treated_data[
-                    treated_data['relative_time'] == baseline_relative_time
-                ][self.outcome_col]
-                control_baseline = control_data[
-                    control_data['relative_time'] == baseline_relative_time
-                ][self.outcome_col]
-                
-                if len(treated_baseline) == 0 or len(control_baseline) == 0:
-                    continue
-                
-                y_t_base = treated_baseline.iloc[0]
-                y_c_base = control_baseline.iloc[0]
-                
-                # Compute DiD for each post-treatment period
-                for e in range(-pre_periods, post_periods + 1):
-                    if e == baseline_relative_time:
+                # Compute baseline values
+                if use_all_preperiods_baseline:
+                    # Use average of ALL available pre-treatment periods
+                    # (not limited by pre_periods to ensure consistent estimates)
+                    treated_pre = treated_data[treated_data['relative_time'] < 0][self.outcome_col]
+                    control_pre = control_data[control_data['relative_time'] < 0][self.outcome_col]
+                    
+                    if len(treated_pre) == 0 or len(control_pre) == 0:
                         continue
                     
+                    y_t_base = treated_pre.mean()
+                    y_c_base = control_pre.mean()
+                else:
+                    # Use single e=-1 period
+                    treated_baseline = treated_data[
+                        treated_data['relative_time'] == -1
+                    ][self.outcome_col]
+                    control_baseline = control_data[
+                        control_data['relative_time'] == -1
+                    ][self.outcome_col]
+                    
+                    if len(treated_baseline) == 0 or len(control_baseline) == 0:
+                        continue
+                    
+                    y_t_base = treated_baseline.iloc[0]
+                    y_c_base = control_baseline.iloc[0]
+                
+                # Compute DiD for each period (including pre-treatment for diagnostics)
+                for e in range(-pre_periods, post_periods + 1):
                     y_t = treated_data[treated_data['relative_time'] == e][self.outcome_col]
                     y_c = control_data[control_data['relative_time'] == e][self.outcome_col]
                     
@@ -765,18 +830,6 @@ class StackedDiD:
         event_study['pvalue'] = 2 * (1 - stats.norm.cdf(
             np.abs(event_study['att'] / event_study['se'].replace(0, np.nan))
         ))
-        
-        # Add baseline
-        baseline_row = pd.DataFrame([{
-            'relative_time': baseline_relative_time,
-            'att': 0.0,
-            'se': 0.0,
-            'n_obs': event_study['n_obs'].max(),
-            'ci_lower': 0.0,
-            'ci_upper': 0.0,
-            'pvalue': 1.0
-        }])
-        event_study = pd.concat([event_study, baseline_row], ignore_index=True)
         event_study = event_study.sort_values('relative_time').reset_index(drop=True)
         
         # Compute overall ATT (post-treatment only)
@@ -808,7 +861,7 @@ def estimate_staggered_att(
     id_col: str = 'cod_conta',
     pre_periods: int = 6,
     post_periods: int = 12,
-    baseline_relative_time: int = -1,
+    use_all_preperiods_baseline: bool = True,
     robustness: bool = False,
 ) -> Union[StaggeredATTResult, Tuple[StaggeredATTResult, Dict]]:
     """
@@ -830,8 +883,9 @@ def estimate_staggered_att(
         Number of pre-treatment periods
     post_periods : int
         Number of post-treatment periods
-    baseline_relative_time : int
-        Reference period for DiD
+    use_all_preperiods_baseline : bool
+        If True (default), uses average of all pre-treatment periods as baseline.
+        This is more robust as it reduces noise from any single period.
     robustness : bool
         Whether to also run stacked DiD robustness check
     
@@ -846,7 +900,7 @@ def estimate_staggered_att(
         outcome_col=outcome_col,
         time_col=time_col,
         id_col=id_col,
-        baseline_relative_time=baseline_relative_time,
+        use_all_preperiods_baseline=use_all_preperiods_baseline,
     )
     
     result = estimator.estimate(pre_periods=pre_periods, post_periods=post_periods)
@@ -865,7 +919,7 @@ def estimate_staggered_att(
     robustness_result = stacked.estimate(
         pre_periods=pre_periods,
         post_periods=post_periods,
-        baseline_relative_time=baseline_relative_time,
+        use_all_preperiods_baseline=use_all_preperiods_baseline,
     )
     
     return result, robustness_result
